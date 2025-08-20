@@ -3,8 +3,8 @@ import re
 import json
 import argparse
 from datetime import datetime
-from urllib.parse import urljoin, urlparse
 from typing import Optional, Dict, Any, List
+from urllib.parse import urljoin, urlparse
 
 import requests
 import pandas as pd
@@ -14,9 +14,9 @@ from dateutil import parser as dateparser
 # =========================
 # Config
 # =========================
-USER_AGENT = "Mozilla/5.0 (compatible; InnovatePGH-EventBot/2.0)"
+USER_AGENT = "Mozilla/5.0 (compatible; InnovatePGH-EventBot/2.2)"
 OPENAI_MODEL_EXTRACT = os.getenv("OPENAI_MODEL_EXTRACT", "gpt-4o-mini")   # small/fast for extraction
-OPENAI_MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-4o-mini")   # summary 150–200 words
+OPENAI_MODEL_SUMMARY = os.getenv("OPENAI_MODEL_SUMMARY", "gpt-4o-mini")   # 150–200 words
 USE_LLM = bool(os.getenv("OPENAI_API_KEY"))
 
 FINAL_COLS = [
@@ -30,6 +30,7 @@ JUNK_TITLES = {
     "view event", "view calendar", "previous events", "next events",
     "today", "search", "menu", "linkedin", "twitter", "instagram",
     "about", "sponsor", "loading view. events search and views navigation search enter keyword.",
+    "complete this sponsorship form.",
 }
 
 # =========================
@@ -56,14 +57,13 @@ def is_junk_title(title: str) -> bool:
         return True
     return False
 
-def guess_title_from_block(text: str) -> str:
-    # crude but cheap: take the first sentence-ish fragment
-    t = normalize_ws(text)
-    m = re.split(r"[.\n]", t, maxsplit=1)
-    return " ".join((m[0] if m else t).split()[:12])
+def http_get(url: str, timeout: int = 30):
+    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+    r.raise_for_status()
+    return r.text, r.url
 
 # =========================
-# Domain-aware link validation (keep thin but precise)
+# Domain-aware link validation (thin but precise)
 # =========================
 def is_probable_event_link(abs_href: str, link_text: str) -> bool:
     if not abs_href:
@@ -82,11 +82,12 @@ def is_probable_event_link(abs_href: str, link_text: str) -> bool:
         "/events$", "/events/", "/events/list", "/events/month", "/calendar",
         "resetpassword", "login", "log-in", "logout", "/sys/", "viewmode",
         "search", "addtaganchorlink", "/sponsor", "#events", "/home",
+        "registration"  # wildapricot / many CMSes
     ]
     if any(ds in href.lower() for ds in deny_substrings):
         return False
 
-    # Host‑specific rules for your current sources
+    # Host‑specific rules for current sources
     host_rules = {
         "community.pdma.org": {
             "allow": ["calendareventkey=", "/event-description"],
@@ -148,15 +149,154 @@ def is_probable_event_link(abs_href: str, link_text: str) -> bool:
     return False
 
 # =========================
-# HTTP + soup
+# Listing → candidates
 # =========================
-def fetch(url: str, timeout: int = 30):
-    resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
-    resp.raise_for_status()
-    return resp.text, resp.url
+def extract_candidates(soup: BeautifulSoup, base_url: str) -> List[Dict[str, str]]:
+    """Find likely event-detail anchors; return (title, url, context_text)."""
+    candidates = []
+    for a in soup.find_all("a"):
+        link_text = a.get_text(" ", strip=True) or ""
+        href = a.get("href")
+        if not href:
+            continue
+        abs_href = urljoin(base_url, href)
+        if not is_probable_event_link(abs_href, link_text):
+            continue
+
+        # try a small container to gather context
+        node = a
+        for _ in range(3):
+            if node and node.parent:
+                node = node.parent
+        context_text = node.get_text(" ", strip=True) if node else link_text
+
+        candidates.append({
+            "title": link_text,
+            "url": abs_href,
+            "context": context_text[:4000],
+        })
+    return candidates
 
 # =========================
-# LLM extraction (JSON mode)
+# Detail page extraction
+# =========================
+def extract_json_ld_events(soup: BeautifulSoup, base_url: str):
+    out = []
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string) if script.string else None
+        except Exception:
+            data = None
+        if not data:
+            continue
+        blocks = data if isinstance(data, list) else [data]
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            types = b.get("@type")
+            types = types if isinstance(types, list) else [types]
+            if "Event" not in [t for t in types if t]:
+                continue
+            url = b.get("url")
+            url = urljoin(base_url, url) if url else None
+            loc_name = None
+            loc_obj = b.get("location") or {}
+            if isinstance(loc_obj, dict):
+                loc_name = loc_obj.get("name")
+                addr = loc_obj.get("address")
+                if isinstance(addr, dict):
+                    parts = [addr.get("streetAddress"), addr.get("addressLocality"),
+                             addr.get("addressRegion"), addr.get("postalCode")]
+                    loc_name = loc_name or ", ".join([p for p in parts if p])
+                elif isinstance(addr, str):
+                    loc_name = loc_name or addr
+            out.append({
+                "name": (b.get("name") or "").strip() or None,
+                "start": b.get("startDate") or b.get("startTime"),
+                "end": b.get("endDate") or b.get("endTime"),
+                "location": loc_name or None,
+                "url": url,
+                "desc": b.get("description") or "",
+            })
+    return out
+
+def extract_title_h1(soup: BeautifulSoup):
+    h1 = soup.find("h1")
+    if h1 and h1.get_text(strip=True):
+        return h1.get_text(strip=True)
+    if soup.title and soup.title.get_text(strip=True):
+        return soup.title.get_text(strip=True)
+    return None
+
+def page_plain_text(soup: BeautifulSoup, limit: int = 12000):
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = soup.get_text(" ", strip=True)
+    return re.sub(r"\s+", " ", text)[:limit]
+
+def build_event_from_detail(detail_url: str, org_name: str, asof_dt: datetime, source_url_for_row: str):
+    try:
+        html, final_url = http_get(detail_url)
+    except Exception:
+        return None
+
+    soup = BeautifulSoup(html, "lxml")
+    # 1) schema.org first
+    ld_events = extract_json_ld_events(soup, final_url)
+    if ld_events:
+        b = ld_events[0]  # usually one event per detail page
+        name = b["name"] or extract_title_h1(soup)
+        dt = dateparser.parse(b["start"]) if b.get("start") else None
+        if dt and dt.date() < asof_dt.date():
+            return None
+        return {
+            "Event Name": name or "",
+            "Event Organiser": org_name,
+            "Date": dt.strftime("%Y-%m-%d") if dt else "",
+            "Day": dt.strftime("%A") if dt else "",
+            "Time": "",  # can be derived from dt if present; leave blank if not clear
+            "Location": b.get("location") or "",
+            "Event URL": b.get("url") or final_url,
+            "Source URL": source_url_for_row,
+            "Summary": "",  # fill later (LLM)
+            "Scraped At": asof_dt.isoformat(),
+            "_context": (b.get("desc","") or "") + " " + page_plain_text(soup),
+        }
+
+    # 2) fallback: h1/title + page text + light date parse
+    name = extract_title_h1(soup)
+    if not name or is_junk_title(name):
+        return None
+
+    whole = page_plain_text(soup)
+    # very light date parse from full page
+    m = re.search(r"(?i)(\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})", whole)
+    dt = dateparser.parse(m.group(0)) if m else None
+    if dt and dt.date() < asof_dt.date():
+        return None
+
+    tm = (re.search(r"(?i)\b(\d{1,2}(:\d{2})?\s*(am|pm))\b", whole) or re.search(r"\b\d{2}:\d{2}\b", whole))
+    loc = None
+    loc_hint = re.search(r"(?i)(location\s*[:\-]\s*)([^|\n]+)", whole)
+    if loc_hint:
+        loc = loc_hint.group(2).strip()
+
+    return {
+        "Event Name": name,
+        "Event Organiser": org_name,
+        "Date": dt.strftime("%Y-%m-%d") if dt else "",
+        "Day": dt.strftime("%A") if dt else "",
+        "Time": tm.group(0) if tm else "",
+        "Location": loc or "",
+        "Event URL": final_url,
+        "Source URL": source_url_for_row,
+        "Summary": "",
+        "Scraped At": asof_dt.isoformat(),
+        "_context": whole,
+    }
+
+# =========================
+# LLM extraction (JSON mode) + Summary
 # =========================
 def llm_extract_event_fields(context_text: str, page_url: str, org_name: Optional[str]) -> Dict[str, Any]:
     """
@@ -238,9 +378,6 @@ TEXT:
     if data["confidence"] > 1: data["confidence"] = 1.0
     return data
 
-# =========================
-# Summary (150–200 words)
-# =========================
 def summarize(name: str, org: Optional[str], raw_text: str) -> str:
     if not USE_LLM:
         # rule-based fallback
@@ -281,122 +418,69 @@ Raw context (may be noisy; deduplicate ideas): {raw_text[:2000]}
     return normalize_ws(resp.choices[0].message.content.strip())
 
 # =========================
-# Extraction flow
-# =========================
-def extract_candidates(soup: BeautifulSoup, base_url: str) -> List[Dict[str, str]]:
-    """Find likely event-detail anchors; return (title, url, context_text)."""
-    candidates = []
-    for a in soup.find_all("a"):
-        link_text = a.get_text(" ", strip=True) or ""
-        href = a.get("href")
-        if not href:
-            continue
-        abs_href = urljoin(base_url, href)
-        if not is_probable_event_link(abs_href, link_text):
-            continue
-
-        # try a small container to gather context
-        node = a
-        for _ in range(3):
-            if node and node.parent:
-                node = node.parent
-        context_text = node.get_text(" ", strip=True) if node else link_text
-
-        candidates.append({
-            "title": link_text,
-            "url": abs_href,
-            "context": context_text[:4000],
-        })
-    return candidates
-
-def build_row_from_llm(block: Dict[str, str], org_name: str, asof_dt: datetime, source_url: str) -> Optional[Dict[str, str]]:
-    data = llm_extract_event_fields(block["context"], block["url"], org_name)
-    # If LLM unavailable or empty → fallback
-    if not data or not data.get("event_name"):
-        # Tiny heuristic fallback
-        name = guess_title_from_block(block["context"])
-        if is_junk_title(name):
-            return None
-        dt = None
-        try:
-            # try to pull a date string from context (very light)
-            m = re.search(r"(?i)(\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})", block["context"])
-            if m:
-                dt = dateparser.parse(m.group(0))
-        except Exception:
-            dt = None
-        if dt and dt.date() < asof_dt.date():
-            return None
-        return {
-            "Event Name": name,
-            "Event Organiser": org_name,
-            "Date": dt.strftime("%Y-%m-%d") if dt else "",
-            "Day": dt.strftime("%A") if dt else "",
-            "Time": (re.search(r"(?i)\b(\d{1,2}(:\d{2})?\s*(am|pm))\b", block["context"]) or re.search(r"\b\d{2}:\d{2}\b", block["context"]) or [None]).group(0) if re.search(r"(?i)\b(\d{1,2}(:\d{2})?\s*(am|pm))\b", block["context"]) or re.search(r"\b\d{2}:\d{2}\b", block["context"]) else "",
-            "Location": "",  # keep light in fallback
-            "Event URL": block["url"],
-            "Source URL": source_url,
-            "Summary": summarize(name, org_name, block["context"]),
-            "Scraped At": asof_dt.isoformat(),
-        }
-
-    # Validate LLM output
-    name = data.get("event_name")
-    if is_junk_title(name):
-        return None
-
-    # Date
-    dt = dateparser.parse(data["date_iso"]) if data.get("date_iso") else None
-    if dt and dt.date() < asof_dt.date():
-        return None
-
-    # require detail URL or date
-    ev_url = data.get("event_url")
-    if not ev_url and not dt:
-        return None
-
-    # day normalization
-    day_name = data.get("day_name") or (dt.strftime("%A") if dt else "")
-    if dt and day_name and day_name != dt.strftime("%A"):
-        day_name = dt.strftime("%A")
-
-    return {
-        "Event Name": name,
-        "Event Organiser": org_name,
-        "Date": dt.strftime("%Y-%m-%d") if dt else "",
-        "Day": day_name or "",
-        "Time": data.get("time_text") or "",
-        "Location": data.get("location") or "",
-        "Event URL": ev_url or "",
-        "Source URL": source_url,
-        "Summary": summarize(name, org_name, block["context"]),
-        "Scraped At": asof_dt.isoformat(),
-    }
-
-# =========================
-# Main scrape for an org
+# Scrape an org: listing → candidates → detail pages → LLM finalize
 # =========================
 def scrape_org(org_name: str, url: str, asof_dt: datetime) -> List[Dict[str, str]]:
-    html, final_url = fetch(url)
+    html, final_url = http_get(url)
     soup = BeautifulSoup(html, "lxml")
 
-    # 1) find likely event detail anchors
+    # 1) find likely event-detail anchors
     blocks = extract_candidates(soup, final_url)
 
-    # 2) LLM extract (or fallback) per block
+    # 2) visit each detail page and build a record
     rows: List[Dict[str, str]] = []
     seen = set()
     for b in blocks:
-        row = build_row_from_llm(b, org_name, asof_dt, final_url)
-        if not row:
+        detail_row = build_event_from_detail(b["url"], org_name, asof_dt, source_url_for_row=final_url)
+        if not detail_row:
             continue
-        key = (row["Event Name"].lower(), row["Date"], row["Event URL"].lower())
+        key = (detail_row["Event Name"].lower(), detail_row["Date"], detail_row["Event URL"].lower())
         if key in seen:
             continue
         seen.add(key)
-        rows.append(row)
+        rows.append(detail_row)
 
-    return rows
+    # 3) finalize fields via LLM (if available) and add 150–200 word summary
+    finalized: List[Dict[str, str]] = []
+    seen2 = set()
+    for r in rows:
+        if USE_LLM:
+            data = llm_extract_event_fields(r.get("_context", ""), r["Event URL"], r["Event Organiser"])
+            # merge only when present
+            if data.get("event_name") and not is_junk_title(data["event_name"]):
+                r["Event Name"] = data["event_name"]
+            if data.get("date_iso"):
+                try:
+                    dt = dateparser.parse(data["date_iso"])
+                    if dt and dt.date() >= asof_dt.date():
+                        r["Date"] = dt.strftime("%Y-%m-%d")
+                        r["Day"]  = dt.strftime("%A")
+                except Exception:
+                    pass
+            if data.get("time_text"): r["Time"] = data["time_text"]
+            if data.get("location"):  r["Location"] = data["location"]
+            if data.get("event_url"): r["Event URL"] = data["event_url"]
+
+        # Summary based on detail page context
+        ctx = r.pop("_context", "")
+        r["Summary"] = summarize(r["Event Name"], r["Event Organiser"], ctx)
+
+        # Drop past events (last guard) and enforce minimal validity
+        if r["Date"]:
+            try:
+                dtt = dateparser.parse(r["Date"])
+                if dtt and dtt.date() < asof_dt.date():
+                    continue
+            except Exception:
+                pass
+
+        key2 = (r["Event Name"].lower(), r["Date"], r["Event URL"].lower())
+        if key2 in seen2:
+            continue
+        seen2.add(key2)
+        finalized.append(r)
+
+    return finalized
 
 # =========================
 # IO
@@ -409,7 +493,7 @@ def read_input(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 def main():
-    parser = argparse.ArgumentParser(description="InnovatePGH Event Scraper – LLM Hybrid")
+    parser = argparse.ArgumentParser(description="InnovatePGH Event Scraper – Detail + LLM Hybrid")
     parser.add_argument("--input", required=True, help="CSV/XLSX with columns: 'Org name', 'URL'")
     parser.add_argument("--output", default="events_out.csv", help="Output CSV path")
     parser.add_argument("--asof", default=datetime.now().isoformat(), help="ISO datetime (filters to future/same-day)")
@@ -420,35 +504,4 @@ def main():
 
     # Accept 'Org name','URL' (case tolerant)
     colmap = {c.strip().lower(): c for c in df.columns}
-    org_col = colmap.get("org name") or colmap.get("org_name") or colmap.get("org") or list(df.columns)[0]
-    url_col = colmap.get("url") or list(df.columns)[1]
-
-    all_rows: List[Dict[str, str]] = []
-    for _, row in df.iterrows():
-        org = str(row.get(org_col) or "").strip()
-        src = str(row.get(url_col) or "").strip()
-        if not src:
-            continue
-        try:
-            out = scrape_org(org, src, asof_dt)
-            all_rows.extend(out)
-        except Exception as e:
-            all_rows.append({
-                "Event Name": "",
-                "Event Organiser": org,
-                "Date": "",
-                "Day": "",
-                "Time": "",
-                "Location": "",
-                "Event URL": "",
-                "Source URL": src,
-                "Summary": f"ERROR: {e}",
-                "Scraped At": asof_dt.isoformat(),
-            })
-
-    out_df = pd.DataFrame(all_rows, columns=FINAL_COLS)
-    out_df.to_csv(args.output, index=False, encoding="utf-8")
-    print(f"Wrote {len(out_df)} rows to {args.output}")
-
-if __name__ == "__main__":
-    main()
+    org_col = colmap.get("org name") or colmap.get("org_name") or colmap.get("org")
