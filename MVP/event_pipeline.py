@@ -370,7 +370,7 @@ TEXT:
     if data["confidence"] > 1: data["confidence"] = 1.0
     return data
 
-def summarize_event_with_llm(name: str, org: str, date: str, time: str, location: str, raw_text: str) -> str:
+def summarize(name: str, org: str, date: str, time: str, location: str, raw_text: str) -> str:
     from openai import OpenAI
     client = OpenAI()
 
