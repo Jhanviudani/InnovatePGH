@@ -1,0 +1,10 @@
+requests
+beautifulsoup4
+python-dateutil
+openpyxl
+pandas
+lxml
+tqdm
+python-dotenv
+openai>=1.30.0
+streamlit
