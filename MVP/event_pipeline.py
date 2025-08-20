@@ -75,68 +75,56 @@ def is_probable_event_link(abs_href: str, link_text: str) -> bool:
     parsed = urlparse(href)
     host = (parsed.netloc or "").lower()
     path = (parsed.path or "").lower()
+    q = (parsed.query or "").lower()
     text = normalize_ws(link_text).lower()
 
-    # Global denies (listing/login/reset/navigation)
+    # Global denies (listing/login/reset/navigation/resources/waivers/guidelines/surveys)
     deny_substrings = [
-        "/events$", "/events/", "/events/list", "/events/month", "/calendar",
+        "/events$", "/events/", "/calendar", "/events/list", "/events/month",
         "resetpassword", "login", "log-in", "logout", "/sys/", "viewmode",
         "search", "addtaganchorlink", "/sponsor", "#events", "/home",
-        "registration"  # wildapricot / many CMSes
+        "/resources", "/resource", "/event-space", "/event-waiver",
+        "surveymonkey.com", "feedback", "guidelines", "pyp-event-guidelines",
+        "/chapters/", "/chapter/", "/pittsburgh-business-events"
     ]
     if any(ds in href.lower() for ds in deny_substrings):
         return False
 
-    # Host‑specific rules for current sources
+    # Host‑specific rules
     host_rules = {
         "community.pdma.org": {
             "allow": ["calendareventkey=", "/event-description"],
             "deny": ["addtaganchorlink", "/home", "/events/"],
         },
-        "ascenderpgh.com": {
-            "allow": ["/event/"],
-            "deny": ["/events/list/"],
-        },
-        "www.robopgh.org": {
-            "allow": ["/robotics-discovery-day", "eventbrite.com/e"],
-            "deny": ["/events", "/sponsor"],
-        },
-        "robopgh.org": {
-            "allow": ["/robotics-discovery-day", "eventbrite.com/e"],
-            "deny": ["/events", "/sponsor"],
-        },
-        "www.bigidea.pitt.edu": {
-            "allow": ["/event/"],
-            "deny": ["/events/month", "/events/20", "/events/"],  # calendar/list pages
-        },
-        "www.pghtech.org": {
-            "allow": ["/events/"],  # detail pages under /events/<slug>
-            "deny": ["/events$"],
-        },
-        "amapittsburgh.org": {
-            "allow": ["/event/"],
-            "deny": ["/events/"],
-        },
-        "pyp23.wildapricot.org": {
-            "allow": ["/event-"],   # detail is /event-<id>
-            "deny": ["resetpassword", "/sys/", "/events", "viewmode", "registration"],
-        },
-        "getwitit.org": {
-            "allow": ["eventbrite.com/e"],
-            "deny": ["/chapter/", "/chapter/pittsburgh-chapter/"],
-        },
-        "eventbrite.com": {
-            "allow": ["/e/"],
-            "deny": [],
-        }
+        "ascenderpgh.com":       {"allow": ["/event/"], "deny": ["/events/list/","/event-space/"]},
+        "www.robopgh.org":       {"allow": ["/robotics-discovery-day", "eventbrite.com/e"], "deny": ["/events", "/sponsor"]},
+        "robopgh.org":           {"allow": ["/robotics-discovery-day", "eventbrite.com/e"], "deny": ["/events", "/sponsor"]},
+        "www.bigidea.pitt.edu":  {"allow": ["/event/"], "deny": ["/events/month", "/events/20", "/events/"]},
+        "www.pghtech.org":       {"allow": ["/events/"], "deny": ["/events$"]},
+        "amapittsburgh.org":     {"allow": ["/event/"], "deny": ["/events/"]},
+        "pyp23.wildapricot.org": {"allow": ["/event-"], "deny": ["resetpassword", "/sys/", "/events", "viewmode", "registration", "guidelines"]},
+        "getwitit.org":          {"allow": ["eventbrite.com/e"], "deny": ["/chapter/", "/chapters/"]},
+        "eventbrite.com":        {"allow": ["/e/"], "deny": []},
+        "bridgecityconnections.com": {"allow": [], "deny": ["/pittsburgh-business-events"]},  # aggregator page only
+        "ellevatenetwork.com":   {"allow": ["/events/"], "deny": ["/events?$","/chapters/","/event-waiver"]},
     }
 
     if host in host_rules:
         allow, deny = host_rules[host]["allow"], host_rules[host]["deny"]
         if any(d in href.lower() for d in deny):
             return False
-        if any(a in href.lower() for a in allow):
+        if allow and any(a in href.lower() for a in allow):
             return True
+
+    # Meetup guard: only accept Pittsburgh groups (e.g., /producttank-pittsburgh/, /code-and-coffee-pgh/)
+    if host.endswith("meetup.com"):
+        # Require a group path containing "pittsburgh" or "pgh"
+        if not re.search(r"(pittsburgh|pgh)", path):
+            return False
+        # detail links include /events/<id>
+        if "/events/" not in path:
+            return False
+        return True
 
     # Generic allow: detail-y paths
     if "/event/" in path or "calendareventkey=" in href.lower() or "eventbrite.com/e" in href.lower():
@@ -241,6 +229,10 @@ def build_event_from_detail(detail_url: str, org_name: str, asof_dt: datetime, s
         return None
 
     soup = BeautifulSoup(html, "lxml")
+    title = (soup.title.get_text(strip=True) if soup.title else "")[:140].lower()
+    if any(x in title for x in ["waiver","guidelines","feedback","survey","resources","resource","event space","our spaces"]):
+        return None
+
     # 1) schema.org first
     ld_events = extract_json_ld_events(soup, final_url)
     if ld_events:
@@ -380,31 +372,27 @@ TEXT:
 
 def summarize(name: str, org: Optional[str], raw_text: str) -> str:
     if not USE_LLM:
-        # rule-based fallback
         base = normalize_ws(raw_text)
-        snippet = " ".join(base.split()[:120])
-        parts = []
-        if name: parts.append(f"{name} is an upcoming event")
-        if org: parts.append(f"hosted by {org}")
-        parts.append("for Pittsburgh’s startup and tech community.")
-        if snippet: parts.append(f"Highlights: {snippet}.")
-        return normalize_ws(" ".join(parts))
+        # take first meaningful ~60–80 words from body (skip nav words)
+        sentences = re.split(r"(?<=[.!?])\s+", base)
+        body = " ".join([s for s in sentences if len(s.split()) > 6][:5])  # ~5 decent sentences
+        opener = f"{name} is a community event" if not org else f"{name} is a community event hosted by {org}"
+        return normalize_ws(f"{opener}. {body}")[:1100]
 
     from openai import OpenAI
     client = OpenAI()
     prompt = f"""
-You are an expert newsletter editor. Craft ONE polished paragraph of ~150–200 words (no bullets) for an event.
+You are an expert newsletter editor. Write ONE paragraph of ~150–200 words (no bullets, no headings, no 'Highlights:').
 
-Requirements:
-- Open with what the event is and who it is for.
-- Mention organizer "{org or 'Unknown'}" succinctly.
-- Describe core topic, expected format (panel/workshop/networking), and practical takeaways.
-- If time/place are clearly present, include them briefly; if unclear, omit rather than guess.
-- Avoid hype, clichés, and exclamation marks.
-- Paraphrase—do NOT copy phrasing from the source.
+Cover:
+- What the event is and who it’s for.
+- Organizer "{org or 'Unknown'}".
+- Format (panel/workshop/networking) and practical takeaways.
+- If time/location are clearly present, include briefly; if unclear, omit (do not invent).
+- Paraphrase and keep it concise.
 
 Event name: "{name or 'Unknown'}"
-Raw context (may be noisy; deduplicate ideas): {raw_text[:2000]}
+Source text (deduped body): {raw_text[:1800]}
 """
     resp = client.chat.completions.create(
         model=OPENAI_MODEL_SUMMARY,
@@ -482,6 +470,37 @@ def scrape_org(org_name: str, url: str, asof_dt: datetime) -> List[Dict[str, str
 
     return finalized
 
+def _strip_boilerplate(text: str) -> str:
+    # Remove common chrome fragments that poison summaries
+    junk_patterns = [
+        r"Skip to main content.*?",
+        r"Toggle navigation",
+        r"\b(About|Events|Programs|Membership|Donate|Contact)\b(?![\w-])",
+        r"Login|Log In|Sign In|Sign Up",
+        r"Add to calendar.*?(Google Calendar|iCalendar|Outlook)",
+        r"Cookie(s)? Policy|Privacy|Terms|Accessibility",
+        r"Find my tickets|Eventbrite.*?(Find Events|Create Events|Help Center)",
+        r"Menu Close",
+    ]
+    t = text
+    for pat in junk_patterns:
+        t = re.sub(pat, " ", t, flags=re.IGNORECASE)
+    # de-duplicate long repeated sequences
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def page_plain_text(soup: BeautifulSoup, limit: int = 10000):
+    # remove obvious non-content nodes
+    for sel in ["script","style","noscript","header","footer","nav","form","aside"]:
+        for tag in soup.find_all(sel):
+            tag.decompose()
+    # favor a main content container if present
+    main = soup.find("main") or soup.find(attrs={"role":"main"}) or soup.body
+    text = main.get_text(" ", strip=True) if main else soup.get_text(" ", strip=True)
+    text = _strip_boilerplate(text)
+    return text[:limit]
+
+
 # =========================
 # IO
 # =========================
@@ -505,3 +524,5 @@ def main():
     # Accept 'Org name','URL' (case tolerant)
     colmap = {c.strip().lower(): c for c in df.columns}
     org_col = colmap.get("org name") or colmap.get("org_name") or colmap.get("org")
+
+

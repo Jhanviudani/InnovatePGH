@@ -18,6 +18,13 @@ st.title("InnovatePGH – Event Scraper")
 api_key = None
 if "OPENAI_API_KEY" in st.secrets:
     api_key = st.secrets["OPENAI_API_KEY"]
+    if api_key:
+        os.environ["OPENAI_API_KEY"] = api_key
+        st.success("OpenAI API key loaded from secrets or input. LLM extraction + summaries ENABLED.")
+        st.caption(f"Models: extract={os.environ.get('OPENAI_MODEL_EXTRACT','gpt-4o-mini')}, summary={os.environ.get('OPENAI_MODEL_SUMMARY','gpt-4o-mini')}")
+else:
+    st.warning("No API key found in Streamlit secrets or input. Fallback heuristics will be used (summaries will be generic).")
+
 
 # Optional model overrides via secrets
 if "OPENAI_MODEL_EXTRACT" in st.secrets:
