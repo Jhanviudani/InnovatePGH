@@ -39,7 +39,7 @@ JUNK_TITLES = {
 def normalize_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
-def is_junk_title(title: str) -> bool:
+def is_junk_title(title: Optional[str]) -> bool:
     if not title:
         return True
     t = normalize_ws(title).lower()
@@ -58,6 +58,9 @@ def is_junk_title(title: str) -> bool:
     return False
 
 def http_get(url: str, timeout: int = 30):
+    # Guard against accidental 'nan' / empty
+    if not url or url.strip().lower() == "nan":
+        raise ValueError("Empty or NaN URL")
     r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
     r.raise_for_status()
     return r.text, r.url
@@ -71,11 +74,12 @@ def is_probable_event_link(abs_href: str, link_text: str) -> bool:
     href = abs_href.strip()
     if href.startswith("#"):
         return False
+    if href.lower() == "nan" or href.lower().startswith("mailto:") or href.lower().startswith("tel:"):
+        return False
 
     parsed = urlparse(href)
     host = (parsed.netloc or "").lower()
     path = (parsed.path or "").lower()
-    q = (parsed.query or "").lower()
     text = normalize_ws(link_text).lower()
 
     # Global denies (listing/login/reset/navigation/resources/waivers/guidelines/surveys)
@@ -105,7 +109,7 @@ def is_probable_event_link(abs_href: str, link_text: str) -> bool:
         "pyp23.wildapricot.org": {"allow": ["/event-"], "deny": ["resetpassword", "/sys/", "/events", "viewmode", "registration", "guidelines"]},
         "getwitit.org":          {"allow": ["eventbrite.com/e"], "deny": ["/chapter/", "/chapters/"]},
         "eventbrite.com":        {"allow": ["/e/"], "deny": []},
-        "bridgecityconnections.com": {"allow": [], "deny": ["/pittsburgh-business-events"]},  # aggregator page only
+        "bridgecityconnections.com": {"allow": [], "deny": ["/pittsburgh-business-events"]},
         "ellevatenetwork.com":   {"allow": ["/events/"], "deny": ["/events?$","/chapters/","/event-waiver"]},
     }
 
@@ -118,10 +122,8 @@ def is_probable_event_link(abs_href: str, link_text: str) -> bool:
 
     # Meetup guard: only accept Pittsburgh groups (e.g., /producttank-pittsburgh/, /code-and-coffee-pgh/)
     if host.endswith("meetup.com"):
-        # Require a group path containing "pittsburgh" or "pgh"
         if not re.search(r"(pittsburgh|pgh)", path):
             return False
-        # detail links include /events/<id>
         if "/events/" not in path:
             return False
         return True
@@ -216,11 +218,33 @@ def extract_title_h1(soup: BeautifulSoup):
         return soup.title.get_text(strip=True)
     return None
 
-def page_plain_text(soup: BeautifulSoup, limit: int = 12000):
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    text = soup.get_text(" ", strip=True)
-    return re.sub(r"\s+", " ", text)[:limit]
+def _strip_boilerplate(text: str) -> str:
+    junk_patterns = [
+        r"Skip to main content.*?",
+        r"Toggle navigation",
+        r"\b(About|Events|Programs|Membership|Donate|Contact)\b(?![\w-])",
+        r"Login|Log In|Sign In|Sign Up",
+        r"Add to calendar.*?(Google Calendar|iCalendar|Outlook)",
+        r"Cookie(s)? Policy|Privacy|Terms|Accessibility",
+        r"Find my tickets|Eventbrite.*?(Find Events|Create Events|Help Center)",
+        r"Menu Close",
+    ]
+    t = text
+    for pat in junk_patterns:
+        t = re.sub(pat, " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def page_plain_text(soup: BeautifulSoup, limit: int = 10000):
+    # remove obvious non-content nodes
+    for sel in ["script","style","noscript","header","footer","nav","form","aside"]:
+        for tag in soup.find_all(sel):
+            tag.decompose()
+    # favor a main content container if present
+    main = soup.find("main") or soup.find(attrs={"role":"main"}) or soup.body
+    text = main.get_text(" ", strip=True) if main else soup.get_text(" ", strip=True)
+    text = _strip_boilerplate(text)
+    return text[:limit]
 
 def build_event_from_detail(detail_url: str, org_name: str, asof_dt: datetime, source_url_for_row: str):
     try:
@@ -291,12 +315,6 @@ def build_event_from_detail(detail_url: str, org_name: str, asof_dt: datetime, s
 # LLM extraction (JSON mode) + Summary
 # =========================
 def llm_extract_event_fields(context_text: str, page_url: str, org_name: Optional[str]) -> Dict[str, Any]:
-    """
-    Use LLM to extract a single event from noisy context.
-    Returns:
-      event_name, date_iso, day_name, time_text, location, event_url, confidence
-    Any field may be None if unclear. No guessing.
-    """
     if not USE_LLM:
         return {}
 
@@ -371,11 +389,13 @@ TEXT:
     return data
 
 def summarize(name: str, org: Optional[str], raw_text: str) -> str:
+    """
+    Safe summary: no references to undefined variables; works with or without LLM.
+    """
     if not USE_LLM:
         base = normalize_ws(raw_text)
-        # take first meaningful ~60–80 words from body (skip nav words)
         sentences = re.split(r"(?<=[.!?])\s+", base)
-        body = " ".join([s for s in sentences if len(s.split()) > 6][:5])  # ~5 decent sentences
+        body = " ".join([s for s in sentences if len(s.split()) > 6][:5])
         opener = f"{name} is a community event" if not org else f"{name} is a community event hosted by {org}"
         return normalize_ws(f"{opener}. {body}")[:1100]
 
@@ -383,13 +403,8 @@ def summarize(name: str, org: Optional[str], raw_text: str) -> str:
     client = OpenAI()
     prompt = f"""
 You are an expert newsletter editor. Write ONE paragraph of ~150–200 words (no bullets, no headings, no 'Highlights:').
-
-Cover:
-- What the event is and who it’s for.
-- Organizer "{org or 'Unknown'}".
-- Format (panel/workshop/networking) and practical takeaways.
-- If time/location are clearly present, include briefly; if unclear, omit (do not invent).
-- Paraphrase and keep it concise.
+Cover: what it is, who it's for, organizer "{org or 'Unknown'}", format (panel/workshop/networking), and practical takeaways.
+If time/location are unclear in the text, omit them—do not invent. Vary the opening (avoid always starting with "Join...").
 
 Event name: "{name or 'Unknown'}"
 Source text (deduped body): {raw_text[:1800]}
@@ -422,13 +437,15 @@ def scrape_org(org_name: str, url: str, asof_dt: datetime) -> List[Dict[str, str
         detail_row = build_event_from_detail(b["url"], org_name, asof_dt, source_url_for_row=final_url)
         if not detail_row:
             continue
-        key = (detail_row["Event Name"].lower(), detail_row["Date"], detail_row["Event URL"].lower())
+        key = ((detail_row.get("Event Name") or "").lower(),
+               detail_row.get("Date") or "",
+               (detail_row.get("Event URL") or "").lower())
         if key in seen:
             continue
         seen.add(key)
         rows.append(detail_row)
 
-    # 3) finalize fields via LLM (if available) and add 150–200 word summary
+    # 3) finalize fields via LLM (if available) and add summary
     finalized: List[Dict[str, str]] = []
     seen2 = set()
     for r in rows:
@@ -449,12 +466,11 @@ def scrape_org(org_name: str, url: str, asof_dt: datetime) -> List[Dict[str, str
             if data.get("location"):  r["Location"] = data["location"]
             if data.get("event_url"): r["Event URL"] = data["event_url"]
 
-        # Summary based on detail page context
         ctx = r.pop("_context", "")
-        r["Summary"] = summarize(r["Event Name"], r["Event Organiser"], ctx)
+        r["Summary"] = summarize(r.get("Event Name",""), r.get("Event Organiser",""), ctx)
 
         # Drop past events (last guard) and enforce minimal validity
-        if r["Date"]:
+        if r.get("Date"):
             try:
                 dtt = dateparser.parse(r["Date"])
                 if dtt and dtt.date() < asof_dt.date():
@@ -462,44 +478,15 @@ def scrape_org(org_name: str, url: str, asof_dt: datetime) -> List[Dict[str, str
             except Exception:
                 pass
 
-        key2 = (r["Event Name"].lower(), r["Date"], r["Event URL"].lower())
+        key2 = ((r.get("Event Name") or "").lower(),
+                r.get("Date") or "",
+                (r.get("Event URL") or "").lower())
         if key2 in seen2:
             continue
         seen2.add(key2)
         finalized.append(r)
 
     return finalized
-
-def _strip_boilerplate(text: str) -> str:
-    # Remove common chrome fragments that poison summaries
-    junk_patterns = [
-        r"Skip to main content.*?",
-        r"Toggle navigation",
-        r"\b(About|Events|Programs|Membership|Donate|Contact)\b(?![\w-])",
-        r"Login|Log In|Sign In|Sign Up",
-        r"Add to calendar.*?(Google Calendar|iCalendar|Outlook)",
-        r"Cookie(s)? Policy|Privacy|Terms|Accessibility",
-        r"Find my tickets|Eventbrite.*?(Find Events|Create Events|Help Center)",
-        r"Menu Close",
-    ]
-    t = text
-    for pat in junk_patterns:
-        t = re.sub(pat, " ", t, flags=re.IGNORECASE)
-    # de-duplicate long repeated sequences
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-def page_plain_text(soup: BeautifulSoup, limit: int = 10000):
-    # remove obvious non-content nodes
-    for sel in ["script","style","noscript","header","footer","nav","form","aside"]:
-        for tag in soup.find_all(sel):
-            tag.decompose()
-    # favor a main content container if present
-    main = soup.find("main") or soup.find(attrs={"role":"main"}) or soup.body
-    text = main.get_text(" ", strip=True) if main else soup.get_text(" ", strip=True)
-    text = _strip_boilerplate(text)
-    return text[:limit]
-
 
 # =========================
 # IO
@@ -523,6 +510,45 @@ def main():
 
     # Accept 'Org name','URL' (case tolerant)
     colmap = {c.strip().lower(): c for c in df.columns}
-    org_col = colmap.get("org name") or colmap.get("org_name") or colmap.get("org")
+    org_col = colmap.get("org name") or colmap.get("org_name") or colmap.get("org") or list(df.columns)[0]
+    url_col = colmap.get("url") or list(df.columns)[1]
 
+    rows_all: List[Dict[str, str]] = []
+    for _, row in df.iterrows():
+        org = str(row.get(org_col) or "").strip()
+        src_val = row.get(url_col)
+        # robust URL cleaning (avoid 'nan' strings)
+        if isinstance(src_val, str):
+            src = src_val.strip()
+            if not src or src.lower() == "nan":
+                continue
+        else:
+            if pd.isna(src_val):
+                continue
+            src = str(src_val).strip()
+            if not src or src.lower() == "nan":
+                continue
 
+        try:
+            out = scrape_org(org, src, asof_dt)
+            rows_all.extend(out)
+        except Exception as e:
+            rows_all.append({
+                "Event Name": "",
+                "Event Organiser": org,
+                "Date": "",
+                "Day": "",
+                "Time": "",
+                "Location": "",
+                "Event URL": "",
+                "Source URL": src,
+                "Summary": f"ERROR: {e}",
+                "Scraped At": asof_dt.isoformat(),
+            })
+
+    out_df = pd.DataFrame(rows_all, columns=FINAL_COLS)
+    out_df.to_csv(args.output, index=False)
+    print(f"Wrote {len(out_df)} rows to {args.output}")
+
+if __name__ == "__main__":
+    main()

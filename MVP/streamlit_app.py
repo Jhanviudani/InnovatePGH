@@ -1,30 +1,26 @@
 import os
-import io
 from datetime import datetime
 
 import streamlit as st
 import pandas as pd
 from dateutil import parser as dateparser
 
-# Local import: the pipeline script must be in the same folder
+# Local import: must be in the same folder with this exact name
 import event_pipeline as ep
 
 st.set_page_config(page_title="InnovatePGH Event Scraper", layout="wide")
-
 st.title("InnovatePGH – Event Scraper")
 
 # ==== OpenAI API Key via Streamlit Secrets ====
-# Priority: st.secrets -> environment -> (optional) text input
 api_key = None
 if "OPENAI_API_KEY" in st.secrets:
     api_key = st.secrets["OPENAI_API_KEY"]
-    if api_key:
-        os.environ["OPENAI_API_KEY"] = api_key
-        st.success("OpenAI API key loaded from secrets or input. LLM extraction + summaries ENABLED.")
-        st.caption(f"Models: extract={os.environ.get('OPENAI_MODEL_EXTRACT','gpt-4o-mini')}, summary={os.environ.get('OPENAI_MODEL_SUMMARY','gpt-4o-mini')}")
+if api_key:
+    os.environ["OPENAI_API_KEY"] = api_key
+    st.success("OpenAI API key loaded from secrets. LLM extraction + summaries ENABLED.")
+    st.caption(f"Models: extract={os.environ.get('OPENAI_MODEL_EXTRACT','gpt-4o-mini')}, summary={os.environ.get('OPENAI_MODEL_SUMMARY','gpt-4o-mini')}")
 else:
-    st.warning("No API key found in Streamlit secrets or input. Fallback heuristics will be used (summaries will be generic).")
-
+    st.warning("No API key found in Streamlit secrets. Fallback heuristics will be used (summaries generic).")
 
 # Optional model overrides via secrets
 if "OPENAI_MODEL_EXTRACT" in st.secrets:
@@ -32,17 +28,13 @@ if "OPENAI_MODEL_EXTRACT" in st.secrets:
 if "OPENAI_MODEL_SUMMARY" in st.secrets:
     os.environ["OPENAI_MODEL_SUMMARY"] = st.secrets["OPENAI_MODEL_SUMMARY"]
 
-# Allow user override (useful on local dev)
+# Allow manual override (useful for local dev)
 with st.expander("OpenAI Settings", expanded=False):
     manual_key = st.text_input("OpenAI API Key (overrides secrets for this session)", type="password")
     if manual_key:
         api_key = manual_key
-
-if api_key:
-    os.environ["OPENAI_API_KEY"] = api_key
-    st.success("OpenAI API key loaded.")
-else:
-    st.warning("OpenAI API key not found in Streamlit Secrets. Summaries/LLM extraction will use rule-based fallback.")
+        os.environ["OPENAI_API_KEY"] = api_key
+        st.success("OpenAI API key loaded for this session.")
 
 # ==== Input controls ====
 st.markdown("Upload a CSV/XLSX with **Org name** and **URL** columns.")
@@ -53,7 +45,15 @@ asof_str = st.text_input("As-of datetime (ISO8601)", value=asof_default)
 
 run_btn = st.button("Run Scrape", type="primary", use_container_width=True)
 
-# ==== Run pipeline ====
+def _clean_cell(val) -> str:
+    # Convert NaN/None to "", and "nan" (string) to ""
+    if isinstance(val, str):
+        s = val.strip()
+        return "" if s.lower() == "nan" else s
+    if pd.isna(val):
+        return ""
+    return str(val).strip()
+
 if run_btn:
     if not uploaded:
         st.error("Please upload an input file.")
@@ -78,16 +78,18 @@ if run_btn:
     # Map columns (tolerant)
     colmap = {c.strip().lower(): c for c in df_in.columns}
     org_col = colmap.get("org name") or colmap.get("org_name") or colmap.get("org") or list(df_in.columns)[0]
-    url_col = colmap.get("url") or list(df_in.columns)[1]
+    url_col = colmap.get("url") or (list(df_in.columns)[1] if len(df_in.columns) > 1 else org_col)
 
     rows_all = []
     prog = st.progress(0.0, text="Scraping...")
-    total = len(df_in)
+    total = len(df_in) if len(df_in) > 0 else 1
 
     for i, (_, r) in enumerate(df_in.iterrows(), start=1):
-        org = str(r.get(org_col) or "").strip()
-        src = str(r.get(url_col) or "").strip()
+        org = _clean_cell(r.get(org_col))
+        src = _clean_cell(r.get(url_col))
         if not src:
+            # skip blanks and 'nan'
+            prog.progress(min(i/total, 1.0), text=f"Skipped blank URL ({i}/{total})")
             continue
         try:
             out = ep.scrape_org(org, src, asof_dt)
@@ -105,7 +107,7 @@ if run_btn:
                 "Summary": f"ERROR: {e}",
                 "Scraped At": asof_dt.isoformat(),
             })
-        prog.progress(min(i/total, 1.0), text=f"Scraped {i}/{total}")
+        prog.progress(min(i/total, 1.0), text=f"Processed {i}/{total}")
 
     # Build output DataFrame
     out_df = pd.DataFrame(rows_all, columns=ep.FINAL_COLS)
@@ -124,4 +126,6 @@ if run_btn:
     )
 
     # Quick metrics
-    st.caption(f"Rows: {len(out_df)} | With Date: {(out_df['Date'].astype(str).str.len()>0).sum()} | With URL: {(out_df['Event URL'].astype(str).str.len()>0).sum()}")
+    with_date = (out_df["Date"].astype(str).str.len() > 0).sum() if not out_df.empty else 0
+    with_url = (out_df["Event URL"].astype(str).str.len() > 0).sum() if not out_df.empty else 0
+    st.caption(f"Rows: {len(out_df)} | With Date: {with_date} | With URL: {with_url}")
