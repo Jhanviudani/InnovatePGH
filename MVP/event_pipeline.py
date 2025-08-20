@@ -370,46 +370,40 @@ TEXT:
     if data["confidence"] > 1: data["confidence"] = 1.0
     return data
 
-def summarize(name: str, org: str, date: str, time: str, location: str, raw_text: str) -> str:
+def summarize(name: str, org: Optional[str], raw_text: str) -> str:
+    if not USE_LLM:
+        base = normalize_ws(raw_text)
+        # take first meaningful ~60–80 words from body (skip nav words)
+        sentences = re.split(r"(?<=[.!?])\s+", base)
+        body = " ".join([s for s in sentences if len(s.split()) > 6][:5])  # ~5 decent sentences
+        opener = f"{name} is a community event" if not org else f"{name} is a community event hosted by {org}"
+        return normalize_ws(f"{opener}. {body}")[:1100]
+
     from openai import OpenAI
     client = OpenAI()
-
     prompt = f"""
-You are a newsletter editor. Write one engaging but concise event blurb (about 120–160 words, not shorter than 100). 
-Follow the style of these examples:
+You are an expert newsletter editor. Write ONE paragraph of ~150–200 words (no bullets, no headings, no 'Highlights:').
 
----
-BioBreakfast: Explains the need for networking, highlights who attends, makes it welcoming, and stresses regularity. 
-Open Mic Night: Highlights format (short pitches), energy, who should attend, and the vibe (food/drinks).
-Summer Fridays: Conversational, casual, encourages participation, shows variety of ways to engage.
----
+Cover:
+- What the event is and who it’s for.
+- Organizer "{org or 'Unknown'}".
+- Format (panel/workshop/networking) and practical takeaways.
+- If time/location are clearly present, include briefly; if unclear, omit (do not invent).
+- Paraphrase and keep it concise.
 
-Now write a blurb for the following event. Keep it professional yet lively. 
-Do not use bullet points, headings, or "highlights". 
-Blend together:
-- What the event is and why it matters
-- Who it’s for (audience, community)
-- The vibe (casual? formal? high-energy? networking? learning?)
-- Any logistics that make it easy to join (time, cost, registration, recurring nature)
-
-Event name: {name}
-Organizer: {org or "Unknown"}
-Date: {date or "Unknown"} {time or ""}
-Location: {location or "Unknown"}
-Event details (raw site text): {raw_text[:1800]}
+Event name: "{name or 'Unknown'}"
+Source text (deduped body): {raw_text[:1800]}
 """
-
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=OPENAI_MODEL_SUMMARY,
         messages=[
-            {"role": "system", "content": "You are an expert at writing engaging newsletter event blurbs."},
-            {"role": "user", "content": prompt}
+            {"role":"system","content":"You write precise, concise, plagiarism-free newsletter blurbs."},
+            {"role":"user","content":prompt}
         ],
-        temperature=0.5,
-        max_tokens=400,
+        temperature=0.3,
+        max_tokens=480
     )
-    return resp.choices[0].message.content.strip()
-
+    return normalize_ws(resp.choices[0].message.content.strip())
 
 # =========================
 # Scrape an org: listing → candidates → detail pages → LLM finalize
